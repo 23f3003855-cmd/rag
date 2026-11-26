@@ -377,14 +377,26 @@ def query():
     except Exception as e:
         out = {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
         raw += " | ERROR " + repr(e)
-    if len(LOG) < 500:
-        LOG.append({"raw": raw, "answer": out})
+    try:
+        import json as _j, time as _t
+        with open("/tmp/rag_log.jsonl", "a") as f:
+            f.write(_j.dumps({"t": round(_t.time()), "raw": raw[:600], "ans": (out["answer"] or None) and out["answer"][:160],
+                              "src": out["sources"], "conf": out["confidence"]}) + "\n")
+    except Exception:
+        pass
     return jsonify(out)
 
 
 @app.route("/dump", methods=["GET"])
 def dump():
-    return jsonify(total=len(LOG), items=LOG[-60:])
+    import json as _j
+    items = []
+    try:
+        with open("/tmp/rag_log.jsonl") as f:
+            items = [_j.loads(x) for x in f.read().splitlines()[-80:]]
+    except Exception:
+        pass
+    return jsonify(total=len(items), items=items)
 
 
 @app.route("/", methods=["GET"])
