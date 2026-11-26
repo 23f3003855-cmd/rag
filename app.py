@@ -360,16 +360,31 @@ def cors(resp):
     return resp
 
 
+LOG = []
+
+
 @app.route("/query", methods=["POST", "OPTIONS"])
 def query():
     if request.method == "OPTIONS":
         return ("", 204)
-    body = request.get_json(force=True, silent=True) or {}
+    raw = request.get_data(as_text=True)[:3000]
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        body = {}
+    qtext = body.get("question") or body.get("query") or body.get("q") or body.get("prompt") or ""
     try:
-        out = respond(body.get("question", ""), body.get("top_k", 3))
-    except Exception:
+        out = respond(qtext, body.get("top_k", 3))
+    except Exception as e:
         out = {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
+        raw += " | ERROR " + repr(e)
+    if len(LOG) < 500:
+        LOG.append({"raw": raw, "answer": out})
     return jsonify(out)
+
+
+@app.route("/dump", methods=["GET"])
+def dump():
+    return jsonify(total=len(LOG), items=LOG[-60:])
 
 
 @app.route("/", methods=["GET"])
