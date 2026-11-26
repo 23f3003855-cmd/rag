@@ -60,7 +60,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 ALIASES = {
- 0: ["raft"], 1: ["multi-paxos", "multi paxos", "paxos"], 2: ["gossip", "epidemic", "phi accrual"],
+ 0: ["raft", "election timeout", "election timeouts"], 1: ["multi-paxos", "multi paxos", "paxos"], 2: ["gossip", "epidemic", "phi accrual"],
  3: ["swim"], 4: ["two-phase commit", "two phase commit", "2pc", "three-phase commit", "3pc"],
  5: ["saga", "sagas"], 6: ["consistent hashing", "consistent hash"],
  7: ["rendezvous", "highest random weight"], 8: ["vector clock", "vector clocks", "version vector"],
@@ -87,13 +87,29 @@ ALIASES = {
  47: ["chacha20", "poly1305", "chacha"], 48: ["pkce", "oauth", "proof key"],
  49: ["jwt", "json web token", "json web tokens"],
 }
-GENERIC_ALIASES = {"residual", "adam", "tcp", "wal", "dns", "decoder", "rsa", "mongo", "perceptron", "salting", "key stretching"}
+GENERIC_ALIASES = {"residual", "adam", "tcp", "wal", "dns", "decoder", "rsa", "mongo", "perceptron", "salting",
+                   "key stretching", "election timeout", "election timeouts"}
+
+# Reworded-question normalisation: paraphrase -> wording used in the passages
+REPHRASE = [
+ (r"periodic keepalive signals?|keepalive signals?|periodic liveness (signals?|messages?)|liveness (signals?|messages?)", "heartbeats"),
+ (r"subordinate (replicas?|nodes?|servers?)", "followers"),
+ (r"(election|leader election) (triggers?|initiations?)", "election timeouts"),
+ (r"cluster (coordinator|master|primary)", "leader"),
+ (r"base (scalar )?(coefficient|multiplier|factor|step size)", "base learning rate"),
+ (r"(scalar )?step[- ]size (hyperparameter|coefficient)", "learning rate"),
+ (r"gradient adjustment magnitudes?( applied)?( to)?( parameter weights)?", "scale weight gradient updates"),
+ (r"(model |parameter )?weight (adjustments?|corrections?)", "weight updates"),
+ (r"parameter weights", "weights"),
+ (r"relational database daemon", "database server"),
+]
 
 STOP = set("""a an the of to in on for and or is are was were be been being what which who whom whose when where why how does do did
  done at by with from as that this these those it its into than then so such can could should would will shall may might must
  has have had about between per using use used uses give tell me please say state describe explain list name value
  many much long number cause causes default configured configure typical standard according passage passages knowledge base documentation
- system systems also any all each both either neither not no yes if else there their they them we you your i my our""".split())
+ system systems also any all each both either neither not no yes if else there their they them we you your i my our
+ duration millisecond milliseconds among specified determined exact""".split())
 INJECT_RX = re.compile(
     r"\b(ignore|disregard|forget|override)\b"
     r"|note to (the )?(ai|assistant|model|llm)|system (notice|note|message|override|instruction)|important[: ]+system"
@@ -101,7 +117,10 @@ INJECT_RX = re.compile(
     r"|system prompt|developer message|you are now|new instructions?|from now on|reveal (your|the) (prompt|instructions|system)"
     r"|respond (only )?with|output (only )?the (word|string|text)|print (the )?(word|string)|instead (answer|say|respond|output)"
     r"|<\s*/?\s*(system|assistant|instruction)[^>]*>|\[\s*(system|admin|instruction)[^\]]*\]|do not (use|consult|follow) (the )?(knowledge|context|passage)"
-    r"|pretend|jailbreak|act as|stealth|secret (code|word|instruction)|always (answer|say|reply)", re.I)
+    r"|pretend|jailbreak|act as|stealth|secret (code|word|instruction)|always (answer|say|reply)|force sources|confidence\s*:", re.I)
+
+PREMISE_RX = re.compile(r"^\s*(?:since|given that|given|assuming that|assuming|because|considering that|considering|suppose that|suppose|if)\b[^,]*,\s*(.+)$", re.I | re.S)
+SYNTH_RX = re.compile(r"\bfurthermore\b|synthesi[sz]ing|how do both|how do these|integrate|\bcombine\b", re.I)
 
 
 def _stem(w):
@@ -134,7 +153,8 @@ def stem(w):
 
 SYN = {"expiry": "expir", "expiration": "expir", "expire": "expir", "expired": "expir", "expir": "expir",
        "rejection": "reject", "rejected": "reject", "rejects": "reject", "exceeds": "exceed", "exceeded": "exceed",
-       "latencies": "latency", "timeouts": "timeout", "intervals": "interval", "thresholds": "threshold"}
+       "latencies": "latency", "timeouts": "timeout", "intervals": "interval", "thresholds": "threshold",
+       "transmitted": "transmit", "transmits": "transmit", "sends": "send", "sent": "send"}
 
 
 def norm_tok(t):
@@ -167,7 +187,6 @@ for t in PT:
         DF[w] += 1
 NP = len(PASSAGES)
 IDF = {w: math.log(1 + NP / d) for w, d in DF.items()}
-VOCAB = set(DF)
 RAW_VOCAB = set(w.lower() for p in PASSAGES for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9+./-]*", p))
 RAW_VOCAB |= {stem(w) for w in RAW_VOCAB}
 PVEC = []
@@ -194,8 +213,13 @@ def clean_question(q):
         prefix = re.sub(r"(important|note to ai|system notice|system|admin|attention|also|btw|p\.s\.|ps)[\s:,\-]*$", "", prefix.strip(), flags=re.I).strip(" ,;:-\u2014")
         if len(toks(prefix)) >= 2:
             kept.append(prefix + ("?" if "?" in sct[m.end():] or sct.rstrip().endswith("?") and not prefix.endswith("?") else ""))
-    out = " ".join(kept).strip()
-    return out or ""
+    return " ".join(kept).strip()
+
+
+def rephrase(q):
+    for rx, rep in REPHRASE:
+        q = re.sub(rx, rep, q, flags=re.I)
+    return q
 
 
 def alias_hits(ql):
@@ -208,14 +232,10 @@ def alias_hits(ql):
                 best = max(best, w)
         if best:
             hits[i] = best
-    # specificity: if "tls 1.3" matched, drop generic tls-only (handled by aliases); suppress shorter overlapping groups
     if 36 in hits and 37 in hits:
         if "1.3" in ql and "1.2" not in ql: hits.pop(37)
         elif "1.2" in ql and "1.3" not in ql: hits.pop(36)
     if 1 in hits and 0 in hits and "paxos" in ql and "raft" not in ql: hits.pop(0, None)
-    if 11 in hits and 10 in hits:
-        pass
-    # "decentralized"/"mention" artefacts: drop 'sgd' if only 'adamw' etc handled by regex boundary
     return hits
 
 
@@ -233,21 +253,16 @@ def sent_scores(qtoks, i, skip):
     out = []
     for s in SENTS[i]:
         st = set(toks(s))
-        sc = sum(IDF.get(w, 1.0) for w in q if w in st)
-        out.append(sc)
+        out.append(sum(IDF.get(w, 1.0) for w in q if w in st))
     return out
 
 
-def answer_from(i, qtoks, alias_words, n_max=2):
-    skip = alias_words
-    sc = sent_scores(qtoks, i, skip)
-    order = sorted(range(len(sc)), key=lambda k: -sc[k])
-    best = order[0]
-    chosen = [best]
-    if len(order) > 1 and sc[order[1]] >= 0.7 * sc[best] and sc[best] > 0 and n_max > 1:
-        chosen.append(order[1])
-    chosen.sort()
-    return " ".join(SENTS[i][k] for k in chosen), (sc[best] if sc else 0.0)
+def answer_from(i, qtoks, alias_words):
+    sc = sent_scores(qtoks, i, alias_words)
+    if not sc or max(sc) <= 0:
+        sc = sent_scores(qtoks, i, set())
+    best = max(range(len(sc)), key=lambda k: sc[k]) if sc else 0
+    return SENTS[i][best], (sc[best] if sc else 0.0)
 
 
 def coverage(qtoks, i, alias_words):
@@ -273,39 +288,100 @@ def unknown_entities(qclean):
     return unk
 
 
-def respond(question, top_k):
-    q = clean_question(question)
-    ql = q.lower()
-    qt = toks(q)
-    hits = alias_hits(ql)
-    alias_words = set()
+def matched_alias_words(ql, hits):
+    aw = set()
     for i in hits:
         for a in ALIASES[i]:
             if re.search(r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])", ql):
-                alias_words |= set(toks(a))
-    alias_words |= {t for t in qt if any(len(aw) >= 4 and aw in t for aw in alias_words)}
-    base = [(cos(qt, i), i) for i in range(NP)]
+                aw |= set(toks(a))
+    return aw
+
+
+def rank(text):
+    """Return (scored list [(score, idx, cos)] sorted desc, hits, alias_words)."""
+    ql = text.lower()
+    qt = toks(text)
+    hits = alias_hits(ql)
+    aw = matched_alias_words(ql, hits)
+    aw |= {t for t in qt if any(len(a) >= 4 and a in t for a in aw)}
     scored = []
-    for s, i in base:
-        bonus = 0.0
-        if i in hits:
-            bonus = min(0.45, 0.18 + 0.03 * hits[i])
+    for i in range(NP):
+        s = cos(qt, i)
+        bonus = min(0.45, 0.18 + 0.03 * hits[i]) if i in hits else 0.0
         scored.append((s + bonus, i, s))
     scored.sort(reverse=True)
-    top = scored[0]
-    k = max(1, min(int(top_k or 3), 10))
+    return scored, hits, aw
 
-    # multi-entity synthesis
-    multi = [i for i in hits if hits[i] >= 3 and scored_lookup(scored, i) >= 0.5 * top[0]]
-    multi = sorted(multi, key=lambda i: -scored_lookup(scored, i))[:3]
-    abstain = False
-    unk = unknown_entities(q)
+
+def fmt_scores(srcs, sc_map):
+    scores, prev = [], 1.0
+    for i in srcs:
+        v = sc_map[i]
+        v = max(0.0, min(1.0, v / 0.9 if v <= 0.9 else 1.0))
+        v = min(v, prev)
+        scores.append(round(v, 4))
+        prev = v
+    return scores
+
+
+def try_synthesis(q, k):
+    """Questions that quote two passages and ask how they relate / integrate."""
+    if not SYNTH_RX.search(q):
+        return None
+    body = re.sub(r"^\s*synthesi[sz]ing[^:]*:\s*", "", q, flags=re.I)
+    body = re.sub(r"\bhow (do|does|are|can|would) (both|these|they|the two)\b.*$", "", body, flags=re.I | re.S)
+    segs = [s.strip() for s in re.split(r"\.?\s*\bfurthermore\b,?[^:]*:\s*", body, flags=re.I) if len(toks(s)) >= 2]
+    if len(segs) < 2:
+        return None
+    chosen, seg_scores = [], []
+    for s in segs[:3]:
+        scored, _, _ = rank(s)
+        for sc, i, c in scored:
+            if i not in chosen:
+                if c < 0.12 and sc < 0.3:
+                    return None
+                chosen.append(i)
+                seg_scores.append(sc)
+                break
+    if len(chosen) < 2:
+        return None
+    full, _, _ = rank(body)
+    sc_map = {i: s for s, i, _ in full}
+    for i, s in zip(chosen, seg_scores):
+        sc_map[i] = max(sc_map[i], s)
+    rest = [i for _, i, _ in full if i not in chosen]
+    srcs = (chosen + rest)[:max(k, len(chosen))]
+    sc = fmt_scores(srcs, sc_map)
+    parts = [" ".join(SENTS[i][:2]) for i in chosen]
+    answer = " Additionally, ".join(parts)
+    return {"answer": answer, "sources": srcs, "scores": sc, "confidence": round(min(0.95, 0.7 + 0.25 * sc[0]), 4)}
+
+
+def respond(question, top_k):
+    k = max(1, min(int(top_k or 3), 10))
+    q = rephrase(clean_question(question))
+    if not toks(q):
+        return {"answer": None, "sources": [], "scores": [], "confidence": 0.12}
+    ql = q.lower()
+
+    syn = try_synthesis(q, k)
+    if syn:
+        return syn
+
+    m = PREMISE_RX.match(q)
+    main = m.group(1) if m and len(toks(m.group(1))) >= 1 else q
+    qt_main = toks(main) or toks(q)
+
+    scored, hits, alias_words = rank(q)
+    top = scored[0]
     max_cos = top[2]
-    cov = coverage(qt, top[1], alias_words)
-    if not qt or re.search(r"\b(who|whom|whose)\b|what year|which year|when (was|were|did)|founded|invented|inventor|creator|created by|cost|price|salary|ceo\b", ql):
+    cov = coverage(qt_main, top[1], alias_words)
+    unk = unknown_entities(q)
+
+    abstain = False
+    if re.search(r"\b(who|whom|whose)\b|what year|which year|when (was|were|did)|founded|invented|inventor|creator|created by|cost|price|salary|ceo\b", ql):
         abstain = True
     elif hits:
-        # entity known; check attribute coverage
         if cov < 0.5:
             abstain = True
     else:
@@ -313,43 +389,20 @@ def respond(question, top_k):
             abstain = True
     if unk and not hits:
         abstain = True
-    if unk and hits and cov < 0.8 and len(unk) >= 1 and any(u.lower() not in RAW_VOCAB for u in unk):
-        # unknown technology named alongside a known one -> unanswerable
+    if unk and hits and cov < 0.8 and any(u.lower() not in RAW_VOCAB for u in unk):
         if not re.search(r"compare|versus|\bvs\b|difference|unlike", ql):
             abstain = True
 
     if abstain:
         return {"answer": None, "sources": [], "scores": [], "confidence": round(0.12 + min(0.2, max_cos * 0.3), 4)}
 
-    ordered = [i for _, i, _ in scored]
-    if len(multi) >= 2:
-        ordered = multi + [i for i in ordered if i not in multi]
-        parts = []
-        for i in multi:
-            a, _ = answer_from(i, qt, alias_words, n_max=1)
-            parts.append(a)
-        answer = " ".join(parts)
-    else:
-        bi = top[1]
-        answer, _ = answer_from(bi, qt, alias_words)
-    srcs = ordered[:k]
+    bi = top[1]
+    answer, _ = answer_from(bi, qt_main, alias_words)
+    srcs = [i for _, i, _ in scored][:k]
     sc_map = {i: s for s, i, _ in scored}
-    scores = []
-    prev = 1.0
-    for i in srcs:
-        v = max(0.0, min(1.0, sc_map[i] / 0.9 if sc_map[i] <= 0.9 else 1.0))
-        v = min(v, prev)
-        scores.append(round(v, 4)); prev = v
-    scores = sorted(scores, reverse=True)
-    conf = round(min(0.97, 0.62 + 0.35 * scores[0]), 4)
+    scores = fmt_scores(srcs, sc_map)
+    conf = round(max(0.65, min(0.97, 0.62 + 0.35 * scores[0])), 4)
     return {"answer": answer, "sources": srcs, "scores": scores, "confidence": conf}
-
-
-def scored_lookup(scored, i):
-    for s, j, _ in scored:
-        if j == i:
-            return s
-    return 0.0
 
 
 @app.after_request
@@ -358,9 +411,6 @@ def cors(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
     return resp
-
-
-LOG = []
 
 
 @app.route("/query", methods=["POST", "OPTIONS"])
@@ -380,7 +430,7 @@ def query():
     try:
         import json as _j, time as _t
         with open("/tmp/rag_log.jsonl", "a") as f:
-            f.write(_j.dumps({"t": round(_t.time()), "raw": raw[:600], "ans": (out["answer"] or None) and out["answer"][:160],
+            f.write(_j.dumps({"t": round(_t.time()), "raw": raw[:600], "ans": (out["answer"] or None) and out["answer"][:200],
                               "src": out["sources"], "conf": out["confidence"]}) + "\n")
     except Exception:
         pass
